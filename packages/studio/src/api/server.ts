@@ -106,6 +106,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         }
       },
       externalContext: overrides?.externalContext,
+      largeImportThreshold: currentConfig.largeImportThreshold,
+      mapConcurrency: currentConfig.mapConcurrency,
+      largeImportMaxCharsPerChunk: currentConfig.largeImportMaxCharsPerChunk,
     };
   }
 

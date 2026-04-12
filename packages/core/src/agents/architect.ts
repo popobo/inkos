@@ -5,6 +5,7 @@ import { readGenreProfile } from "./rules-reader.js";
 import { writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { renderHookSnapshot } from "../utils/memory-retrieval.js";
+import { chunkChapters, type ChapterChunk } from "../utils/chapter-chunker.js";
 
 export interface ArchitectOutput {
   readonly storyBible: string;
@@ -12,6 +13,29 @@ export interface ArchitectOutput {
   readonly bookRules: string;
   readonly currentState: string;
   readonly pendingHooks: string;
+}
+
+/** Partial foundation extracted from one chapter chunk (Map phase). */
+export interface ChunkExtract {
+  readonly chunkRange: string;
+  readonly characters: string;
+  readonly worldBuilding: string;
+  readonly plotEvents: string;
+  readonly hooks: string;
+  readonly stateAtEnd: string;
+  readonly narrativeObservations: string;
+  readonly numericalSystem?: string;
+}
+
+export interface ImportMapReduceBuildOptions {
+  readonly importMode?: "continuation" | "series";
+  readonly maxCharsPerChunk?: number;
+  readonly mapConcurrency?: number;
+}
+
+export interface MergeChunkExtractsOptions {
+  readonly importMode?: "continuation" | "series";
+  readonly reviewFeedback?: string;
 }
 
 export class ArchitectAgent extends BaseAgent {
@@ -679,6 +703,502 @@ ${keyPrinciplesPrompt}`;
     ], { maxTokens: 16384, temperature: 0.5 });
 
     return this.parseSections(response.content);
+  }
+
+  /**
+   * Map phase: split chapters into chunks and run per-chunk extraction (parallelism bounded).
+   */
+  async buildImportChunkExtracts(
+    book: BookConfig,
+    chapters: ReadonlyArray<{ readonly title: string; readonly content: string }>,
+    options?: ImportMapReduceBuildOptions,
+  ): Promise<ChunkExtract[]> {
+    const maxChars = options?.maxCharsPerChunk ?? 50_000;
+    const concurrency = Math.max(1, Math.min(16, options?.mapConcurrency ?? 3));
+    const chunks = chunkChapters(chapters, maxChars);
+    if (chunks.length === 0) {
+      return [];
+    }
+    return this.mapWithConcurrency(chunks, concurrency, (chunk) =>
+      this.extractChunkFoundation(book, chunk, chapters.length, {
+        importMode: options?.importMode,
+      }),
+    );
+  }
+
+  /**
+   * Reduce phase: merge chunk extracts into full ArchitectOutput (hierarchical when needed).
+   */
+  async mergeChunkExtracts(
+    book: BookConfig,
+    extracts: ReadonlyArray<ChunkExtract>,
+    options?: MergeChunkExtractsOptions,
+  ): Promise<ArchitectOutput> {
+    if (extracts.length === 0) {
+      throw new Error("mergeChunkExtracts requires at least one ChunkExtract");
+    }
+    let layer = [...extracts];
+    while (layer.length > 4) {
+      const nextLayer: ChunkExtract[] = [];
+      for (let i = 0; i < layer.length; i += 2) {
+        const left = layer[i]!;
+        const right = layer[i + 1];
+        if (right) {
+          nextLayer.push(await this.mergePairChunkExtracts(book, left, right));
+        } else {
+          nextLayer.push(left);
+        }
+      }
+      layer = nextLayer;
+    }
+    return this.mergeChunkExtractsToArchitectOutput(book, layer, options);
+  }
+
+  /** Build chunk extracts then merge (no foundation review). */
+  async generateFoundationMapReduce(
+    book: BookConfig,
+    chapters: ReadonlyArray<{ readonly title: string; readonly content: string }>,
+    options?: ImportMapReduceBuildOptions & MergeChunkExtractsOptions,
+  ): Promise<ArchitectOutput> {
+    const extracts = await this.buildImportChunkExtracts(book, chapters, {
+      importMode: options?.importMode,
+      maxCharsPerChunk: options?.maxCharsPerChunk,
+      mapConcurrency: options?.mapConcurrency,
+    });
+    return this.mergeChunkExtracts(book, extracts, {
+      importMode: options?.importMode,
+      reviewFeedback: options?.reviewFeedback,
+    });
+  }
+
+  async extractChunkFoundation(
+    book: BookConfig,
+    chunk: ChapterChunk,
+    totalChapters: number,
+    options?: { readonly importMode?: "continuation" | "series" },
+  ): Promise<ChunkExtract> {
+    const { profile: gp, body: genreBody } =
+      await readGenreProfile(this.ctx.projectRoot, book.genre);
+    const resolvedLanguage = book.language ?? gp.language;
+    const chunkBody = this.formatChunkChaptersText(chunk, resolvedLanguage);
+    const rangeLabel = `${chunk.startChapter}-${chunk.endChapter}`;
+    const isSeries = options?.importMode === "series";
+
+    const positionNote =
+      resolvedLanguage === "en"
+        ? `This is chapters ${rangeLabel} of ${totalChapters} total. Extract only from this slice; note cross-chapter continuity at boundaries.`
+        : `这是全书共 ${totalChapters} 章中的第 ${rangeLabel} 章片段。只根据本片段提取；注意与前后章的衔接线索。`;
+
+    const seriesNote = isSeries
+      ? (resolvedLanguage === "en"
+          ? "Series mode: flag elements that could seed a NEW conflict dimension later (do not write full volume plan here)."
+          : "系列模式：标注可能用于后续**新冲突维度**的种子要素（此处不写完整卷纲）。")
+      : "";
+
+    const numericalHint = gp.numericalSystem
+      ? (resolvedLanguage === "en"
+          ? "If this slice shows trackable resources/power numbers, summarize in numerical_system."
+          : "若本片段出现可追踪的数值/资源/等级体系，写入 numerical_system。")
+      : "";
+
+    const systemPrompt =
+      resolvedLanguage === "en"
+        ? `You are extracting structured story signals from a PART of an imported web novel.
+Output ONLY the tagged sections below (English). Be exhaustive for this slice; prefer recall over brevity.
+Do NOT output story_bible or volume_outline here — only the extraction sections.
+
+## Genre: ${gp.name} (${book.genre})
+${genreBody}
+
+${positionNote}
+${seriesNote}
+${numericalHint}
+
+## Required output tags (all mandatory)
+You MUST emit every section below with the exact tag spelling: characters, world_building, plot_events, hooks, state_at_end, narrative_observations. For hooks, output a markdown table header row even if no hooks are found (empty table).`
+        : `你是网络小说架构助手，正在从**已导入正文的一个片段**中提取结构化信号。
+只输出下列带标签的部分（中文）。本片段宁可多抓也不要漏抓。
+不要在此处输出完整 story_bible 或 volume_outline — 仅限下列提取块。
+
+## 题材：${gp.name}（${book.genre}）
+${genreBody}
+
+${positionNote}
+${seriesNote}
+${numericalHint}
+
+## 输出标签（缺一不可）
+必须输出且标签名拼写完全一致：characters、world_building、plot_events、hooks、state_at_end、narrative_observations。hooks 若无伏笔也请输出表头行（可无非表头数据行）。`;
+
+    const formatReminder =
+      resolvedLanguage === "en"
+        ? `\n\nEmit sections in this exact delimiter form (English tag names only):\n=== SECTION: characters ===\n...\n=== SECTION: world_building ===\n...\n=== SECTION: plot_events ===\n...\n=== SECTION: hooks ===\n| hook_id | ... |\n=== SECTION: state_at_end ===\n...\n=== SECTION: narrative_observations ===\n...`
+        : `\n\n请严格使用下列分隔行（标签名必须为英文）：\n=== SECTION: characters ===\n...\n=== SECTION: world_building ===\n...\n=== SECTION: plot_events ===\n...\n=== SECTION: hooks ===\n| hook_id | ... |\n=== SECTION: state_at_end ===\n...\n=== SECTION: narrative_observations ===\n...`;
+
+    const userPrompt =
+      resolvedLanguage === "en"
+        ? `Book title: "${book.title}".\n\n=== SOURCE SLICE ===\n\n${chunkBody}${formatReminder}`
+        : `书名：《${book.title}》\n\n=== 正文片段 ===\n\n${chunkBody}${formatReminder}`;
+
+    const response = await this.chat(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      { maxTokens: 16384, temperature: 0.35 },
+    );
+
+    return this.parseChunkExtract(
+      response.content,
+      rangeLabel,
+      resolvedLanguage === "en" ? "en" : "zh",
+    );
+  }
+
+  private async mergePairChunkExtracts(
+    book: BookConfig,
+    left: ChunkExtract,
+    right: ChunkExtract,
+  ): Promise<ChunkExtract> {
+    const { profile: gp, body: genreBody } =
+      await readGenreProfile(this.ctx.projectRoot, book.genre);
+    const resolvedLanguage = book.language ?? gp.language;
+
+    const mergedRange = `${left.chunkRange}+${right.chunkRange}`;
+    const bundle =
+      resolvedLanguage === "en"
+        ? `## Extract A (chapters ${left.chunkRange})\n${this.serializeChunkExtract(left)}\n\n## Extract B (chapters ${right.chunkRange})\n${this.serializeChunkExtract(right)}`
+        : `## 片段 A（${left.chunkRange}）\n${this.serializeChunkExtract(left)}\n\n## 片段 B（${right.chunkRange}）\n${this.serializeChunkExtract(right)}`;
+
+    const systemPrompt =
+      resolvedLanguage === "en"
+        ? `Merge two partial extractions from the same book into ONE consolidated extraction (English).
+Rules:
+- Deduplicate characters; merge facts; keep contradictions as notes.
+- Merge hooks: if the same clue appears twice, keep one row; update status if one side shows payoff.
+- **state_at_end** must reflect the END of the chronologically later slice (Extract B).
+- Combine plot_events into one ordered timeline.
+
+## Genre: ${gp.name}
+${genreBody}`
+        : `将同一本书的两个局部提取**合并为一份**提取结果（中文）。
+规则：
+- 角色去重合并；信息冲突时在 narrative_observations 中标注。
+- 伏笔表合并：同一线索只保留一行；若一侧显示回收则更新状态。
+- **state_at_end** 必须反映时间顺序上较后的片段（片段 B）的结尾状态。
+- plot_events 合并为一条时间线。
+
+## 题材：${gp.name}
+${genreBody}`;
+
+    const mergeReminder =
+      resolvedLanguage === "en"
+        ? `\n\nOutput merged extraction with the same === SECTION: <name> === delimiters as the inputs (characters, world_building, plot_events, hooks, state_at_end, narrative_observations).`
+        : `\n\n输出合并结果时，继续使用与输入相同的 === SECTION: <name> === 分隔行（characters、world_building、plot_events、hooks、state_at_end、narrative_observations）。`;
+
+    const userPrompt =
+      resolvedLanguage === "en"
+        ? `Book: "${book.title}". Merge A and B.\n\n${bundle}${mergeReminder}`
+        : `书名：《${book.title}》。合并片段 A 与 B。\n\n${bundle}${mergeReminder}`;
+
+    const response = await this.chat(
+      [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+      { maxTokens: 16384, temperature: 0.25 },
+    );
+
+    return this.parseChunkExtract(
+      response.content,
+      mergedRange,
+      resolvedLanguage === "en" ? "en" : "zh",
+    );
+  }
+
+  private async mergeChunkExtractsToArchitectOutput(
+    book: BookConfig,
+    extracts: ReadonlyArray<ChunkExtract>,
+    options?: MergeChunkExtractsOptions,
+  ): Promise<ArchitectOutput> {
+    const { profile: gp, body: genreBody } =
+      await readGenreProfile(this.ctx.projectRoot, book.genre);
+    const resolvedLanguage = book.language ?? gp.language;
+    const reviewFeedbackBlock = this.buildReviewFeedbackBlock(options?.reviewFeedback, resolvedLanguage);
+    const isSeries = options?.importMode === "series";
+
+    const numericalBlock = gp.numericalSystem
+      ? (resolvedLanguage === "en"
+          ? `- Trackable numerical/resource system — book_rules must set numericalSystemOverrides where inferable`
+          : `- 有数值/资源体系 — 在 book_rules 中尽可能给出 numericalSystemOverrides`)
+      : (resolvedLanguage === "en"
+          ? "- No explicit numerical ledger required if absent"
+          : "- 无数值体系则不要臆造资源账本");
+
+    const continuationDirectiveEn = isSeries
+      ? `## Series continuation (critical)
+Design NEW narrative space for unwritten continuation: new conflict vector, ignite within 5 chapters, scene freshness — same as single-pass series import.`
+      : `## Continuation
+Extend naturally from the last imported state; do not recap.`;
+
+    const continuationDirectiveZh = isSeries
+      ? `## 系列续写（关键）
+未写部分须打开新叙事空间：新冲突维度、5章内引爆、场景新鲜度 — 与单次导入 series 规则一致。`
+      : `## 续写
+从导入结束处自然延伸，禁止回顾凑字数。`;
+
+    const serialized = extracts.map((ex, i) =>
+      resolvedLanguage === "en"
+        ? `### Consolidated extract ${i + 1} (chapters ${ex.chunkRange})\n${this.serializeChunkExtract(ex)}`
+        : `### 合并用提取 ${i + 1}（${ex.chunkRange}）\n${this.serializeChunkExtract(ex)}`,
+    ).join("\n\n");
+
+    const systemPrompt =
+      resolvedLanguage === "en"
+        ? `You are a web-fiction architect. Given ${extracts.length} consolidated extraction(s) from a long imported novel, produce the FULL foundation files.
+All five sections MUST be English. Use === SECTION: <name> === separators exactly.
+
+${continuationDirectiveEn}
+${reviewFeedbackBlock}
+
+## Book
+- Title: ${book.title}
+- Platform: ${book.platform}
+- Genre: ${gp.name} (${book.genre})
+- Target chapters: ${book.targetChapters}
+- Chapter length target: ${book.chapterWordCount}
+
+## Genre profile
+${genreBody}
+
+## Global rules
+${numericalBlock}
+- current_state reflects the **global** last imported chapter (end of book), not a slice.
+- pending_hooks merges all hooks; deduplicate; preserve payoff status.
+- volume_outline: summarize imported arc + continuation projection.
+`
+        : `你是网络小说架构师。下面是一份或多份从长篇导入正文**分块提取再合并**后的材料，请输出**完整**五份基础文件。
+五个 section 必须全部为中文。严格使用 === SECTION: <name> === 分隔。
+
+${continuationDirectiveZh}
+${reviewFeedbackBlock}
+
+## 书籍
+- 标题：${book.title}
+- 平台：${book.platform}
+- 题材：${gp.name}（${book.genre}）
+- 目标章数：${book.targetChapters}
+- 每章字数：${book.chapterWordCount}
+
+## 题材特征
+${genreBody}
+
+## 全局规则
+${numericalBlock}
+- current_state 必须反映**全书已导入部分的最后一章**结束状态（不是某一中间块）。
+- pending_hooks 合并全部伏笔并去重；已回收的更新状态。
+- volume_outline：概括已导入弧线 + 后续续写预测。
+`;
+
+    const storyBiblePrompt = resolvedLanguage === "en"
+      ? `Structured second-level headings:
+## 01_Worldview
+## 02_Protagonist
+## 03_Factions_and_Characters
+## 04_Geography_and_Environment
+## 05_Title_and_Blurb (keep title "${book.title}")`
+      : `结构化二级标题：
+## 01_世界观
+## 02_主角
+## 03_势力与人物
+## 04_地理与环境
+## 05_书名与简介（保留书名「${book.title}」）`;
+
+    const volumeOutlinePrompt = resolvedLanguage === "en"
+      ? `Imported arc summary + future continuation volumes (chapter ranges, conflicts, turns).`
+      : `已导入部分卷结构回顾 + 后续续写卷纲（章节范围、核心冲突、转折）。`;
+
+    const bookRulesPrompt = resolvedLanguage === "en"
+      ? `YAML frontmatter + narrative blocks (protagonist lock, genreLock.primary ${book.genre}, prohibitions).`
+      : `YAML frontmatter + 叙事块（主角锁定、genreLock.primary ${book.genre}、禁忌）。`;
+
+    const currentStatePrompt = resolvedLanguage === "en"
+      ? `Markdown table: Current Chapter | Current Location | Protagonist State | Current Goal | Current Constraint | Current Alliances | Current Conflict`
+      : `Markdown 表格：当前章节 | 当前位置 | 主角状态 | 当前目标 | 当前限制 | 当前敌我 | 当前冲突`;
+
+    const pendingHooksPrompt = resolvedLanguage === "en"
+      ? `Table: | hook_id | start_chapter | type | status | latest_progress | expected_payoff | payoff_timing | notes |`
+      : `表格：| hook_id | 起始章节 | 类型 | 状态 | 最近推进 | 预期回收 | 回收节奏 | 备注 |`;
+
+    const userMessage =
+      resolvedLanguage === "en"
+        ? `Produce the five foundation sections from the following consolidated material:\n\n${serialized}`
+        : `根据下列合并后的提取材料，输出五个基础 section：\n\n${serialized}`;
+
+    const contract =
+      resolvedLanguage === "en"
+        ? `=== SECTION: story_bible ===
+${storyBiblePrompt}
+
+=== SECTION: volume_outline ===
+${volumeOutlinePrompt}
+
+=== SECTION: book_rules ===
+${bookRulesPrompt}
+
+=== SECTION: current_state ===
+${currentStatePrompt}
+
+=== SECTION: pending_hooks ===
+${pendingHooksPrompt}`
+        : `=== SECTION: story_bible ===
+${storyBiblePrompt}
+
+=== SECTION: volume_outline ===
+${volumeOutlinePrompt}
+
+=== SECTION: book_rules ===
+${bookRulesPrompt}
+
+=== SECTION: current_state ===
+${currentStatePrompt}
+
+=== SECTION: pending_hooks ===
+${pendingHooksPrompt}`;
+
+    const response = await this.chat(
+      [
+        { role: "system", content: `${systemPrompt}\n\n## Output contract\n${contract}` },
+        { role: "user", content: userMessage },
+      ],
+      { maxTokens: 16384, temperature: 0.45 },
+    );
+
+    return this.parseSections(response.content);
+  }
+
+  private formatChunkChaptersText(chunk: ChapterChunk, resolvedLanguage: "zh" | "en"): string {
+    const parts: string[] = [];
+    const offset = chunk.startChapter - 1;
+    for (let i = 0; i < chunk.chapters.length; i++) {
+      const ch = chunk.chapters[i]!;
+      const globalNum = offset + i + 1;
+      if (resolvedLanguage === "en") {
+        parts.push(`Chapter ${globalNum}: ${ch.title}\n\n${ch.content}`);
+      } else {
+        parts.push(`第${globalNum}章 ${ch.title}\n\n${ch.content}`);
+      }
+    }
+    return parts.join("\n\n---\n\n");
+  }
+
+  private serializeChunkExtract(ex: ChunkExtract): string {
+    const num = ex.numericalSystem?.trim()
+      ? `\n=== SECTION: numerical_system ===\n${ex.numericalSystem}`
+      : "";
+    return `=== SECTION: characters ===
+${ex.characters}
+
+=== SECTION: world_building ===
+${ex.worldBuilding}
+
+=== SECTION: plot_events ===
+${ex.plotEvents}
+
+=== SECTION: hooks ===
+${ex.hooks}
+
+=== SECTION: state_at_end ===
+${ex.stateAtEnd}
+
+=== SECTION: narrative_observations ===
+${ex.narrativeObservations}${num}`;
+  }
+
+  private static emptyHooksTable(layoutLang: "zh" | "en"): string {
+    return layoutLang === "en"
+      ? "| hook_id | start_chapter | type | status | latest_progress | expected_payoff | payoff_timing | notes |\n| --- | --- | --- | --- | --- | --- | --- | --- |"
+      : "| hook_id | 起始章节 | 类型 | 状态 | 最近推进 | 预期回收 | 回收节奏 | 备注 |\n| --- | --- | --- | --- | --- | --- | --- | --- |";
+  }
+
+  private parseChunkExtract(content: string, chunkRange: string, layoutLang: "zh" | "en"): ChunkExtract {
+    const parsedSections = new Map<string, string>();
+    const sectionPattern = /^\s*===\s*SECTION\s*[：:]\s*([^\n=]+?)\s*===\s*$/gim;
+    const matches = [...content.matchAll(sectionPattern)];
+
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i]!;
+      const rawName = match[1] ?? "";
+      const start = (match.index ?? 0) + match[0].length;
+      const end = matches[i + 1]?.index ?? content.length;
+      const normalizedName = this.normalizeSectionName(rawName);
+      parsedSections.set(normalizedName, content.slice(start, end).trim());
+    }
+
+    const pick = (key: string, fallback: string): string => {
+      const section = parsedSections.get(this.normalizeSectionName(key))?.trim();
+      if (!section) {
+        this.ctx.logger?.warn(`Chunk extract ${chunkRange}: missing "${key}"; using placeholder`);
+        return fallback;
+      }
+      return section;
+    };
+
+    const fb = layoutLang === "en"
+      ? {
+          characters: "## Characters\n*(Section missing in model output; downstream merge will reconcile.)*\n",
+          worldBuilding: "## World\n*(Missing — placeholder.)*\n",
+          plotEvents: "## Plot events\n*(Missing — placeholder.)*\n",
+          stateAtEnd: "## State at end\n*(Missing — placeholder.)*\n",
+          narrativeObservations: "## Narrative notes\n*(Missing — placeholder.)*\n",
+        }
+      : {
+          characters: "## 角色\n（模型未输出本段，合并阶段将从其它块综合。）\n",
+          worldBuilding: "## 世界观\n（本段缺失占位。）\n",
+          plotEvents: "## 情节\n（本段缺失占位。）\n",
+          stateAtEnd: "## 段末状态\n（本段缺失占位。）\n",
+          narrativeObservations: "## 叙事观察\n（本段缺失占位。）\n",
+        };
+
+    const hooksKey = this.normalizeSectionName("hooks");
+    let hooksRaw = parsedSections.get(hooksKey)?.trim();
+    if (!hooksRaw) {
+      this.ctx.logger?.warn(`Chunk extract ${chunkRange}: missing hooks section; using empty hook table`);
+      hooksRaw = ArchitectAgent.emptyHooksTable(layoutLang);
+    }
+    const hooks = this.normalizePendingHooksSection(this.stripTrailingAssistantCoda(hooksRaw));
+
+    const numerical = parsedSections.get(this.normalizeSectionName("numerical_system"))?.trim();
+
+    return {
+      chunkRange,
+      characters: pick("characters", fb.characters),
+      worldBuilding: pick("world_building", fb.worldBuilding),
+      plotEvents: pick("plot_events", fb.plotEvents),
+      hooks,
+      stateAtEnd: pick("state_at_end", fb.stateAtEnd),
+      narrativeObservations: pick("narrative_observations", fb.narrativeObservations),
+      numericalSystem: numerical && numerical.length > 0 ? numerical : undefined,
+    };
+  }
+
+  private async mapWithConcurrency<T, R>(
+    items: readonly T[],
+    concurrency: number,
+    fn: (item: T, index: number) => Promise<R>,
+  ): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let cursor = 0;
+    const workerCount = Math.max(1, Math.min(concurrency, items.length));
+    const runWorker = async (): Promise<void> => {
+      while (true) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await fn(items[index]!, index);
+      }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    return results;
   }
 
   async generateFanficFoundation(

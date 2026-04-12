@@ -516,4 +516,177 @@ describe("ArchitectAgent", () => {
 
     await expect(agent.generateFoundation(book)).rejects.toThrow(/book_rules/i);
   });
+
+  const ZH_HOOKS_TABLE = [
+    "| hook_id | 起始章节 | 类型 | 状态 | 最近推进 | 预期回收 | 回收节奏 | 备注 |",
+    "| h1 | 1 | 伏笔 | open | 0 | 回收 | 卷末 | |",
+  ].join("\n");
+
+  function makeChunkExtractResponse(chunkRange: string): string {
+    return [
+      "=== SECTION: characters ===",
+      `# 角色 ${chunkRange}`,
+      "",
+      "=== SECTION: world_building ===",
+      `# 世界 ${chunkRange}`,
+      "",
+      "=== SECTION: plot_events ===",
+      `# 事件 ${chunkRange}`,
+      "",
+      "=== SECTION: hooks ===",
+      ZH_HOOKS_TABLE,
+      "",
+      "=== SECTION: state_at_end ===",
+      `# 状态 ${chunkRange}`,
+      "",
+      "=== SECTION: narrative_observations ===",
+      `# 叙事 ${chunkRange}`,
+    ].join("\n");
+  }
+
+  function makeFullFoundationResponse(): string {
+    return [
+      "=== SECTION: story_bible ===",
+      "# Story Bible MR",
+      "",
+      "=== SECTION: volume_outline ===",
+      "# Volume MR",
+      "",
+      "=== SECTION: book_rules ===",
+      "---\nversion: \"1.0\"\n---\n",
+      "",
+      "=== SECTION: current_state ===",
+      "# State MR",
+      "",
+      "=== SECTION: pending_hooks ===",
+      ZH_HOOKS_TABLE,
+    ].join("\n");
+  }
+
+  it("mergeChunkExtracts invokes one LLM call for two extracts (no pair layer)", async () => {
+    const agent = new ArchitectAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          maxTokens: 4096,
+          thinkingBudget: 0, maxTokensCap: null,
+          extra: {},
+        },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+
+    const book: BookConfig = {
+      id: "mr-book",
+      title: "MR Book",
+      platform: "other",
+      genre: "other",
+      status: "active",
+      targetChapters: 20,
+      chapterWordCount: 2200,
+      language: "zh",
+      createdAt: "2026-03-29T00:00:00.000Z",
+      updatedAt: "2026-03-29T00:00:00.000Z",
+    };
+
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: makeFullFoundationResponse(),
+        usage: ZERO_USAGE,
+      });
+
+    const ex1 = {
+      chunkRange: "1-1",
+      characters: "c1",
+      worldBuilding: "w1",
+      plotEvents: "p1",
+      hooks: ZH_HOOKS_TABLE,
+      stateAtEnd: "s1",
+      narrativeObservations: "n1",
+    };
+    const ex2 = {
+      chunkRange: "2-2",
+      characters: "c2",
+      worldBuilding: "w2",
+      plotEvents: "p2",
+      hooks: ZH_HOOKS_TABLE,
+      stateAtEnd: "s2",
+      narrativeObservations: "n2",
+    };
+
+    const out = await agent.mergeChunkExtracts(book, [ex1, ex2], {});
+
+    expect(chat).toHaveBeenCalledTimes(1);
+    expect(out.storyBible).toContain("Story Bible MR");
+  });
+
+  it("mergeChunkExtracts runs pair merges then final for five extracts", async () => {
+    const agent = new ArchitectAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          maxTokens: 4096,
+          thinkingBudget: 0, maxTokensCap: null,
+          extra: {},
+        },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+
+    const book: BookConfig = {
+      id: "mr-book-5",
+      title: "MR Book Five",
+      platform: "other",
+      genre: "other",
+      status: "active",
+      targetChapters: 50,
+      chapterWordCount: 2200,
+      language: "zh",
+      createdAt: "2026-03-29T00:00:00.000Z",
+      updatedAt: "2026-03-29T00:00:00.000Z",
+    };
+
+    const template = {
+      characters: "c",
+      worldBuilding: "w",
+      plotEvents: "p",
+      hooks: ZH_HOOKS_TABLE,
+      stateAtEnd: "s",
+      narrativeObservations: "n",
+    };
+
+    const extracts = [1, 2, 3, 4, 5].map((i) => ({
+      ...template,
+      chunkRange: `${i}-${i}`,
+    }));
+
+    const chat = vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockImplementation(async (...args: unknown[]) => {
+        const messages = args[0] as Array<{ role: string; content: string }>;
+        const sys = messages[0]?.content ?? "";
+        if (sys.includes("将同一本书的两个局部提取")) {
+          return {
+            content: makeChunkExtractResponse("merged-pair"),
+            usage: ZERO_USAGE,
+          };
+        }
+        return {
+          content: makeFullFoundationResponse(),
+          usage: ZERO_USAGE,
+        };
+      });
+
+    const out = await agent.mergeChunkExtracts(book, extracts, {});
+
+    expect(chat).toHaveBeenCalledTimes(3);
+    expect(out.volumeOutline).toContain("Volume MR");
+  });
 });

@@ -88,6 +88,9 @@ export function buildPipelineConfig(
     externalContext: extra?.externalContext,
     logger,
     onStreamProgress,
+    largeImportThreshold: config.largeImportThreshold,
+    mapConcurrency: config.mapConcurrency,
+    largeImportMaxCharsPerChunk: config.largeImportMaxCharsPerChunk,
   };
 }
 

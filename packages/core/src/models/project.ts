@@ -115,6 +115,12 @@ export const ProjectConfigSchema = z.object({
       retryTemperatureStep: 0.1,
     },
   }),
+  /** When concatenated import text exceeds this (chars), use Map-Reduce foundation. */
+  largeImportThreshold: z.number().int().min(1000).optional(),
+  /** Parallel chunk extractions during large import Map phase (1–16). */
+  mapConcurrency: z.number().int().min(1).max(16).optional(),
+  /** Max characters packed into one Map chunk (whole chapters only). */
+  largeImportMaxCharsPerChunk: z.number().int().min(2000).optional(),
 });
 
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;

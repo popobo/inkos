@@ -70,6 +70,12 @@ export interface PipelineConfig {
   readonly inputGovernanceMode?: InputGovernanceMode;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
+  /** Total imported text length (chars) above which foundation uses Map-Reduce. Default 60000. */
+  readonly largeImportThreshold?: number;
+  /** Max concurrent chunk extractions in Map phase. Default 3. */
+  readonly mapConcurrency?: number;
+  /** Max characters per chapter chunk for Map-Reduce. Default 50000. */
+  readonly largeImportMaxCharsPerChunk?: number;
 }
 
 export interface TokenUsageSummary {
@@ -2000,15 +2006,47 @@ ${matrix}`,
 
         const architect = new ArchitectAgent(this.agentCtxFor("architect", input.bookId));
         const isSeries = input.importMode === "series";
-        const foundation = isSeries
-          ? await this.generateAndReviewFoundation({
-              generate: (reviewFeedback) => architect.generateFoundationFromImport(book, allText, undefined, reviewFeedback, { importMode: "series" }),
-              reviewer: new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", input.bookId)),
-              mode: "series",
-              language: resolvedLanguage === "en" ? "en" : "zh",
-              stageLanguage: resolvedLanguage,
-            })
-          : await architect.generateFoundationFromImport(book, allText);
+        const largeThreshold = this.config.largeImportThreshold ?? 60_000;
+        const useMapReduce = allText.length > largeThreshold;
+
+        let foundation: ArchitectOutput;
+        if (useMapReduce) {
+          log?.info(this.localize(resolvedLanguage, {
+            zh: `正文较长（${allText.length} 字），使用 Map-Reduce 生成基础设定（阈值 ${largeThreshold}）…`,
+            en: `Large import (${allText.length} chars); using Map-Reduce foundation (threshold ${largeThreshold})…`,
+          }));
+          const mapOpts = {
+            importMode: input.importMode,
+            maxCharsPerChunk: this.config.largeImportMaxCharsPerChunk,
+            mapConcurrency: this.config.mapConcurrency,
+          };
+          const extracts = await architect.buildImportChunkExtracts(book, input.chapters, mapOpts);
+          foundation = isSeries
+            ? await this.generateAndReviewFoundation({
+                generate: (reviewFeedback) =>
+                  architect.mergeChunkExtracts(book, extracts, {
+                    importMode: "series",
+                    reviewFeedback,
+                  }),
+                reviewer: new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", input.bookId)),
+                mode: "series",
+                language: resolvedLanguage === "en" ? "en" : "zh",
+                stageLanguage: resolvedLanguage,
+              })
+            : await architect.mergeChunkExtracts(book, extracts, {
+                importMode: input.importMode,
+              });
+        } else if (isSeries) {
+          foundation = await this.generateAndReviewFoundation({
+            generate: (reviewFeedback) => architect.generateFoundationFromImport(book, allText, undefined, reviewFeedback, { importMode: "series" }),
+            reviewer: new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", input.bookId)),
+            mode: "series",
+            language: resolvedLanguage === "en" ? "en" : "zh",
+            stageLanguage: resolvedLanguage,
+          });
+        } else {
+          foundation = await architect.generateFoundationFromImport(book, allText);
+        }
         await architect.writeFoundationFiles(
           bookDir,
           foundation,

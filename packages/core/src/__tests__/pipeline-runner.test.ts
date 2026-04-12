@@ -2908,6 +2908,71 @@ describe("PipelineRunner", () => {
     }
   });
 
+  it("uses Map-Reduce foundation when import text exceeds largeImportThreshold", async () => {
+    const { root, runner, bookId } = await createRunnerFixture({
+      largeImportThreshold: 200,
+    });
+    const body = "章".repeat(400);
+
+    const genSpy = vi.spyOn(ArchitectAgent.prototype, "generateFoundationFromImport").mockRejectedValue(
+      new Error("generateFoundationFromImport should not run for large import"),
+    );
+    const buildSpy = vi.spyOn(ArchitectAgent.prototype, "buildImportChunkExtracts").mockResolvedValue([
+      {
+        chunkRange: "1-1",
+        characters: "c",
+        worldBuilding: "w",
+        plotEvents: "p",
+        hooks:
+          "| hook_id | 起始章节 | 类型 | 状态 | 最近推进 | 预期回收 | 回收节奏 | 备注 |\n| h1 | 1 | 伏笔 | open | 0 | x | y | |",
+        stateAtEnd: "s",
+        narrativeObservations: "n",
+      },
+    ]);
+    vi.spyOn(ArchitectAgent.prototype, "mergeChunkExtracts").mockResolvedValue({
+      storyBible: "# Story Bible\n",
+      volumeOutline: "# Volume Outline\n",
+      bookRules: "---\nversion: \"1.0\"\n---\n\n# Book Rules\n",
+      currentState: createStateCard({
+        chapter: 0,
+        location: "Test",
+        protagonistState: "P",
+        goal: "G",
+        conflict: "C",
+      }),
+      pendingHooks: "# Pending Hooks\n",
+    });
+    vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(
+      createAnalyzedOutput({
+        chapterNumber: 1,
+        title: "Prelude",
+        content: body,
+        wordCount: body.length,
+      }),
+    );
+    vi.spyOn(WriterAgent.prototype, "saveChapter").mockResolvedValue(undefined);
+    vi.spyOn(WriterAgent.prototype, "saveNewTruthFiles").mockResolvedValue(undefined);
+    vi.spyOn(runner, "generateStyleGuide").mockResolvedValue("");
+
+    try {
+      await runner.importChapters({
+        bookId,
+        chapters: [{ title: "Prelude", content: body }],
+      });
+      expect(buildSpy).toHaveBeenCalledTimes(1);
+      expect(genSpy).not.toHaveBeenCalled();
+      expect(buildSpy.mock.calls[0]?.[2]).toEqual(
+        expect.objectContaining({
+          maxCharsPerChunk: undefined,
+          mapConcurrency: undefined,
+          importMode: undefined,
+        }),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   sqliteIt("rebuilds fact history from imported chapter snapshots", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();
 
